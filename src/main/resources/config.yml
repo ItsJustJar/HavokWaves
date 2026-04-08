@@ -1,0 +1,76 @@
+# HavokWaves configuration
+# Packet visuals are client-side illusions; buoyancy makes interaction feel real.
+
+# Keep simulation-radius larger than render-radius so column data is ready at the render edge.
+simulation-radius: 56
+render-radius: 40
+# 2 ticks (100ms) gives smooth visuals while halving tick load vs every-tick updates.
+update-interval-ticks: 2
+
+# Clear weather: gentle rolling swells with calm stretches between sets.
+clear:
+  amplitude: 0.38
+  speed: 0.82
+  wavelength: 28
+  # Lower frequency = fewer, broader wave fronts (natural open-ocean look).
+  frequency: 0.72
+  # Mixed short/tall waves for variety. 0 = uniform heights.
+  height-variation: 0.55
+  # 0..1 gate for sporadic wave packets. Lower = more calm between sets.
+  occurrence: 0.62
+
+# Storm weather: powerful swells with longer period and higher coverage.
+storm:
+  amplitude: 1.55
+  speed: 2.15
+  wavelength: 22
+  frequency: 1.20
+  height-variation: 0.95
+  occurrence: 0.88
+
+max-block-updates-per-tick-per-player: 900
+
+# Empty list means all worlds are allowed.
+worlds-whitelist: []
+
+# Biomes where waves are allowed to render and apply buoyancy.
+# Use biome keys without namespace (e.g. ocean, deep_ocean, beach).
+biomes-whitelist:
+  - ocean
+  - deep_ocean
+  - warm_ocean
+  - lukewarm_ocean
+  - deep_lukewarm_ocean
+  - cold_ocean
+  - deep_cold_ocean
+  - frozen_ocean
+  - deep_frozen_ocean
+  - river
+  - frozen_river
+  - swamp
+  - mangrove_swamp
+  - beach
+  - snowy_beach
+  - stony_shore
+
+# Optional per-world overrides.
+# world-overrides:
+#   world:
+#     clear:
+#       amplitude: 0.10
+#       speed: 0.7
+#       wavelength: 14
+#       frequency: 0.50
+#       height-variation: 0.35
+#       occurrence: 0.20
+#     storm:
+#       amplitude: 0.55
+#       speed: 1.6
+#       wavelength: 7
+#       frequency: 1.10
+#       height-variation: 0.60
+#       occurrence: 0.70
+#     simulation-radius: 40
+#     render-radius: 40
+
+debug: false

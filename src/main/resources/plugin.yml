@@ -1,0 +1,21 @@
+name: HavokWaves
+version: 1.0.0
+main: com.havokwaves.waves.WavesPlugin
+api-version: '1.21'
+folia-supported: true
+author: HavokWaves
+description: Wave illusion with buoyancy interaction for Paper/Folia.
+
+taco-hot-reload: true
+
+commands:
+  waves:
+    description: Toggle, reload, or debug HavokWaves.
+    usage: /waves <on|off|reload|debug>
+permissions:
+  waves.use:
+    description: Allows wave simulation for the player.
+    default: true
+  waves.admin:
+    description: Allows /waves reload and /waves debug.
+    default: op
