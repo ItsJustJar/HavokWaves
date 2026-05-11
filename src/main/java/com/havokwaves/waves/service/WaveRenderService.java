@@ -41,6 +41,10 @@ import static com.havokwaves.waves.service.MaterialPredicates.isVisualReplaceabl
 import static com.havokwaves.waves.service.MaterialPredicates.isWater;
 import static com.havokwaves.waves.service.MaterialPredicates.isWaterBodyMaterial;
 import static com.havokwaves.waves.service.MaterialPredicates.isWaterVegetation;
+import static com.havokwaves.waves.service.WorldProbes.isChunkLoaded;
+import static com.havokwaves.waves.service.WorldProbes.isSurfaceOpenAbove;
+import static com.havokwaves.waves.service.WorldProbes.resolveSurfaceWaterY;
+import static com.havokwaves.waves.service.WorldProbes.waterDepthAt;
 
 public final class WaveRenderService {
     private static final long CHUNK_CACHE_TTL_TICKS = 400L;
@@ -718,18 +722,6 @@ public final class WaveRenderService {
         for (final Map.Entry<Long, FakeBlockState> entry : active.entrySet()) {
             sendPacked(player, entry.getKey(), entry.getValue().restoreMaterial());
         }
-    }
-
-    private int waterDepthAt(final World world, final int x, final int surfaceY, final int z) {
-        final int minY = world.getMinHeight();
-        int depth = 0;
-        for (int y = surfaceY; y >= minY && depth < 16; y--) {
-            if (!isWater(world.getBlockAt(x, y, z).getType())) {
-                break;
-            }
-            depth++;
-        }
-        return depth;
     }
 
     private boolean shouldSkipCrestForCamera(
@@ -1776,10 +1768,6 @@ public final class WaveRenderService {
         return t * t * (3.0D - (2.0D * t));
     }
 
-    private boolean isChunkLoaded(final World world, final int blockX, final int blockZ) {
-        return world.isChunkLoaded(blockX >> 4, blockZ >> 4);
-    }
-
     private void cleanupStaleChunkCache(final long simulationTick) {
         if (lastChunkCacheCleanupTick != Long.MIN_VALUE && (simulationTick - lastChunkCacheCleanupTick) < 200L) {
             return;
@@ -1802,38 +1790,6 @@ public final class WaveRenderService {
                 chunkSurfaceCache.remove(new ChunkCacheKey(worldId, chunkX + dx, chunkZ + dz));
             }
         }
-    }
-
-    private boolean isSurfaceOpenAbove(final World world, final int x, final int y, final int z) {
-        final int maxY = world.getMaxHeight() - 1;
-        for (int yy = y + 1; yy <= maxY && yy <= y + 6; yy++) {
-            final Material above = world.getBlockAt(x, yy, z).getType();
-            if (isWaterVegetation(above)) {
-                continue;
-            }
-            if (isWaterBodyMaterial(above)) {
-                return false;
-            }
-            return isAirLike(above);
-        }
-        return false;
-    }
-
-    private int resolveSurfaceWaterY(final World world, final int x, final int y, final int z, final int floor) {
-        final Material here = world.getBlockAt(x, y, z).getType();
-        if (isWaterBodyMaterial(here) || isWaterVegetation(here)) {
-            return y;
-        }
-        for (int yy = y - 1; yy >= floor; yy--) {
-            final Material below = world.getBlockAt(x, yy, z).getType();
-            if (isWaterBodyMaterial(below) || isWaterVegetation(below)) {
-                return yy;
-            }
-            if (!isWaterVegetation(below)) {
-                break;
-            }
-        }
-        return Integer.MIN_VALUE;
     }
 
     private double clamp(final double value, final double min, final double max) {
