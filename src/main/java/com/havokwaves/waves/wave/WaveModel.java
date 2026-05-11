@@ -10,7 +10,7 @@ public final class WaveModel {
     }
 
     public WaveSample sample(final WaveProfile profile, final double x, final double z, final long simulationTick) {
-        return sample(profile, x, z, simulationTick, 1.0D);
+        return sample(profile, x, z, simulationTick, 1.0D, false, Math.PI * 0.11D);
     }
 
     public WaveSample sample(
@@ -19,6 +19,29 @@ public final class WaveModel {
             final double z,
             final long simulationTick,
             final double shorelineFactor
+    ) {
+        return sample(profile, x, z, simulationTick, shorelineFactor, false, Math.PI * 0.11D);
+    }
+
+    public WaveSample sample(
+            final WaveProfile profile,
+            final double x,
+            final double z,
+            final long simulationTick,
+            final double shorelineFactor,
+            final boolean storming
+    ) {
+        return sample(profile, x, z, simulationTick, shorelineFactor, storming, Math.PI * 0.11D);
+    }
+
+    public WaveSample sample(
+            final WaveProfile profile,
+            final double x,
+            final double z,
+            final long simulationTick,
+            final double shorelineFactor,
+            final boolean storming,
+            final double baseAngle
     ) {
         final double t = simulationTick / 20.0D;
         final double shoreline = clamp(shorelineFactor, 0.12D, 1.0D);
@@ -31,10 +54,17 @@ public final class WaveModel {
         final double travelSpeed = profile.speed() * (0.42D + (freq * 0.62D));
         final double effectiveTravelSpeed = travelSpeed * (1.0D - (shallow * 0.22D));
 
-        final double windAngle = (Math.PI * 0.11D) + (Math.sin(t * 0.006D) * 0.20D);
+        // Storm mode: wind direction shifts more rapidly and with wider sweep, creating
+        // coherent directional swell rather than omnidirectional chop.
+        // baseAngle is the world-seeded drift direction from the render service so model
+        // and visual directions stay in sync.
+        final double windDriftRate = storming ? 0.018D : 0.006D;
+        final double windDriftAmp  = storming ? 0.45D  : 0.20D;
+        final double windAngle = baseAngle + (Math.sin(t * windDriftRate) * windDriftAmp);
         final double windX = Math.cos(windAngle);
         final double windZ = Math.sin(windAngle);
-        final double warpStrength = 2.0D + (stormEnergy * 1.6D);
+        // Reduced warp — too strong and it breaks the directional line structure of the waves.
+        final double warpStrength = 1.2D + (stormEnergy * 1.0D);
         final double warpedX = x
             + (Math.sin((z * 0.018D) + (t * 0.31D)) * warpStrength)
             + (windX * t * 0.40D);
@@ -58,14 +88,21 @@ public final class WaveModel {
         final double ring3 = Math.sin((r3 * (effectiveSpatialK * 0.76D)) - (t * effectiveTravelSpeed * 1.03D));
         final double radialField = (ring1 * 0.46D) + (ring2 * 0.31D) + (ring3 * 0.23D);
 
-        final double a1 = (Math.PI * 0.24D) + (Math.sin(t * 0.017D) * 0.16D);
-        final double a2 = (Math.PI * 0.97D) + (Math.cos(t * 0.015D) * 0.14D);
-        final double a3 = (-Math.PI * 0.57D) + (Math.sin(t * 0.013D) * 0.18D);
+        // All three directional components point roughly the same way (within ~25° of windAngle).
+        // This creates planar rolling waves like real ocean swell, not collision patterns.
+        // a2/a3 are slight angular spreads — enough to add texture without killing directionality.
+        final double a1 = windAngle + (Math.sin(t * 0.011D) * 0.05D);
+        final double a2 = windAngle + 0.40D + (Math.cos(t * 0.013D) * 0.07D);
+        final double a3 = windAngle - 0.36D + (Math.sin(t * 0.009D) * 0.07D);
 
         final double d1 = directionalComponent(warpedX, warpedZ, t, effectiveSpatialK, effectiveTravelSpeed, a1, 1.00D, 1.00D, 0.7D);
-        final double d2 = directionalComponent(warpedX, warpedZ, t, effectiveSpatialK, effectiveTravelSpeed, a2, 0.88D, 0.91D, 2.1D);
-        final double d3 = directionalComponent(warpedX, warpedZ, t, effectiveSpatialK, effectiveTravelSpeed, a3, 0.72D, 0.77D, 4.0D);
-        final double directionalField = (d1 * 0.48D) + (d2 * 0.34D) + (d3 * 0.18D);
+        final double d2 = directionalComponent(warpedX, warpedZ, t, effectiveSpatialK, effectiveTravelSpeed, a2, 0.92D, 0.93D, 2.1D);
+        final double d3 = directionalComponent(warpedX, warpedZ, t, effectiveSpatialK, effectiveTravelSpeed, a3, 0.80D, 0.82D, 4.0D);
+        // Primary swell dominates heavily — d1 carries most of the wave energy.
+        final double d1w = storming ? 0.65D : 0.68D;
+        final double d2w = storming ? 0.22D : 0.20D;
+        final double d3w = 1.0D - d1w - d2w;
+        final double directionalField = (d1 * d1w) + (d2 * d2w) + (d3 * d3w);
 
         final double counterA = directionalComponent(
                 warpedX,
@@ -91,12 +128,17 @@ public final class WaveModel {
         );
         final double collisionField = ((counterA * d2) + (counterB * d1)) * (0.08D + (stormEnergy * 0.28D));
 
+        // Storm: cap omnidirectional cross-chop — real storms produce big directed swells,
+        // not noise in every direction equally.
+        final double crossChopStormScale = storming ? stormEnergy * 0.09D : stormEnergy * 0.16D;
         final double crossChop = Math.sin(
             ((warpedX * 0.061D) - (warpedZ * 0.054D)) * (effectiveSpatialK * 0.63D)
                 - (t * effectiveTravelSpeed * 0.42D)
-        ) * (0.07D + (stormEnergy * 0.16D));
+        ) * (0.07D + crossChopStormScale);
 
-        final double radialWeight = 0.60D - (stormEnergy * 0.10D);
+        // Low radial weight: radial fields add depth/texture but the wave shape is
+        // primarily directional — rolling planar crests, not circular ring patterns.
+        final double radialWeight = 0.18D - (stormEnergy * 0.06D);
         final double directionalWeight = 1.0D - radialWeight;
         final double mixedField = (radialField * radialWeight) + (directionalField * directionalWeight) + crossChop + collisionField;
         final double crestExponent = 1.82D - (stormEnergy * 0.34D);
@@ -119,7 +161,9 @@ public final class WaveModel {
         );
         final double gateStart = 1.0D - occurrence;
         final double gateWidth = 0.18D + (stormEnergy * 0.06D);
-        final double sporadicGate = smoothStep(gateStart, Math.min(0.998D, gateStart + gateWidth), coherenceField);
+        // Floor of 0.12 ensures the gate never fully closes — every area of ocean always
+        // has some wave activity so the water never appears frozen mid-ocean.
+        final double sporadicGate = 0.12D + (0.88D * smoothStep(gateStart, Math.min(0.998D, gateStart + gateWidth), coherenceField));
 
         final double localHeightScale = 1.0D
             + ((coherenceField - 0.5D) * (0.90D + (stormEnergy * 0.46D)) * profile.heightVariation());
@@ -132,7 +176,11 @@ public final class WaveModel {
                 * amplitudeBoost
                 * clamp(localHeightScale, 0.30D, 2.35D);
 
-        final double breakerPulse = Math.max(0.0D, mixedField) * stormEnergy * 0.22D;
+        // Storm: route breakerPulse through a smoothStep so crests roll over gradually
+        // rather than spiking to a peak instantly.
+        final double breakerPulse = storming
+            ? smoothStep(0.30D, 1.0D, Math.max(0.0D, mixedField)) * stormEnergy * 0.18D
+            : Math.max(0.0D, mixedField) * stormEnergy * 0.22D;
         double rawHeight = amplitude * (crestShape + localRipple + breakerPulse) * sporadicGate;
         final double breakerDissipation = 1.0D
             - (Math.max(0.0D, rawHeight) * shallow * (0.14D + (stormEnergy * 0.08D)));
@@ -145,7 +193,7 @@ public final class WaveModel {
         final double threshold = visualThreshold(profile);
         final int visualBand = rawHeight >= threshold ? 1 : (rawHeight <= -threshold ? -1 : 0);
         final double intensity = Math.abs(rawHeight) / Math.max(0.001D, threshold);
-        return new WaveSample(rawHeight, threshold, visualBand, intensity, sporadicGate, shoreline);
+        return new WaveSample(rawHeight, threshold, visualBand, intensity, sporadicGate, shoreline, windAngle);
     }
 
     public double visualThreshold(final WaveProfile profile) {
@@ -188,7 +236,9 @@ public final class WaveModel {
         if (waterDepth <= 1) {
             return 0.15D;
         }
-        final double linear = clamp((waterDepth - 1.0D) / 10.0D, 0.0D, 1.0D);
+        // Divisor 14 vs original 10: amplitude starts tapering at greater depth so the
+        // fade zone is wider and the shoreline approach looks more gradual.
+        final double linear = clamp((waterDepth - 1.0D) / 14.0D, 0.0D, 1.0D);
         final double curved = linear * linear * (3.0D - (2.0D * linear));
         return 0.15D + (curved * 0.85D);
     }
@@ -286,7 +336,8 @@ public final class WaveModel {
             int visualBand,
             double intensity,
             double sporadicGate,
-            double shorelineFactor
+            double shorelineFactor,
+            double windAngle
     ) {
     }
 }

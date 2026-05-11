@@ -3,10 +3,12 @@ package com.havokwaves.waves.service;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -16,7 +18,6 @@ import java.util.function.Supplier;
 import org.bukkit.Bukkit;
 import org.bukkit.HeightMap;
 import org.bukkit.Material;
-import org.bukkit.Particle;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
@@ -37,7 +38,7 @@ import com.havokwaves.waves.wave.WaveModel.WaveSample;
 
 public final class WaveRenderService {
     private static final long CHUNK_CACHE_TTL_TICKS = 400L;
-    private static final long VISUAL_STICKY_TICKS = 40L;
+    private static final long VISUAL_STICKY_TICKS = 12L;
     private static final long SHORE_DIRECTION_CACHE_TTL_TICKS = 600L;
     private static final long COLUMN_VISUAL_MEMORY_TICKS = 220L;
     private static final long PHYSICAL_CELL_BASE_TTL_TICKS = 40L;
@@ -50,9 +51,6 @@ public final class WaveRenderService {
     private static final long RUNUP_TRIGGER_COOLDOWN_TICKS = 18L;
     private static final double RUNUP_ADVANCE_TICKS_PER_BLOCK = 4.0D;
     private static final double RUNUP_RETREAT_TICKS_PER_BLOCK = 5.0D;
-    private static final int SEAFOAM_PARTICLE_BUDGET_PER_TICK = 20;
-    private static final int RAIN_RIPPLE_PARTICLE_BUDGET_PER_TICK = 10;
-    private static final int STORM_SPRAY_PARTICLE_BUDGET_PER_TICK = 6;
     private static final int[] CREST_FLOW_LEVELS = {7, 6, 5, 4, 3, 2, 1};
     private static final int[][] RUNUP_DIRECTIONS = {
             {1, 0}, {-1, 0}, {0, 1}, {0, -1},
@@ -64,6 +62,8 @@ public final class WaveRenderService {
     private final WaveModel waveModel;
     private final Supplier<PluginConfig> configSupplier;
     private final PlayerToggleService toggleService;
+    private final BoatLifter boatLifter;
+    private final WaveParticleEmitter particles;
     private final Map<UUID, PlayerWaveState> playerStates = new ConcurrentHashMap<>();
     private final Map<UUID, Map<Long, ShoreRunupState>> playerRunups = new ConcurrentHashMap<>();
     private final Map<ChunkCacheKey, ChunkSurfaceCache> chunkSurfaceCache = new ConcurrentHashMap<>();
@@ -87,6 +87,8 @@ public final class WaveRenderService {
         this.waveModel = waveModel;
         this.configSupplier = configSupplier;
         this.toggleService = toggleService;
+        this.boatLifter = new BoatLifter(scheduler);
+        this.particles = new WaveParticleEmitter();
     }
 
     public void tickPlayer(final Player player, final long simulationTick) {
@@ -369,10 +371,12 @@ public final class WaveRenderService {
         final int radiusSq = effectiveRenderRadius * effectiveRenderRadius;
         columns.sort(Comparator.comparingInt(column -> distanceSquared(column.x(), column.z(), renderCenterX, renderCenterZ)));
         final Map<Long, FakeBlockState> desired = new LinkedHashMap<>(Math.max(16, columns.size() / 2));
+        final Map<Long, Integer> waveTopByXZ = new HashMap<>();
         final List<PhysicalShorePlacement> physicalPlacements = new ArrayList<>();
-        int seafoamBudget = SEAFOAM_PARTICLE_BUDGET_PER_TICK;
-        int rainRippleBudget = raining ? RAIN_RIPPLE_PARTICLE_BUDGET_PER_TICK : 0;
-        int stormSprayBudget = storming ? STORM_SPRAY_PARTICLE_BUDGET_PER_TICK : 0;
+        int seafoamBudget = WaveParticleEmitter.SEAFOAM_BUDGET_PER_TICK;
+        int crestGlintBudget = WaveParticleEmitter.CREST_GLINT_BUDGET_PER_TICK;
+        int rainRippleBudget = raining ? WaveParticleEmitter.RAIN_RIPPLE_BUDGET_PER_TICK : 0;
+        int stormSprayBudget = storming ? WaveParticleEmitter.STORM_SPRAY_BUDGET_PER_TICK : 0;
 
         for (final SurfaceColumn column : columns) {
             final int distSq = distanceSquared(column.x(), column.z(), renderCenterX, renderCenterZ);
@@ -388,10 +392,12 @@ public final class WaveRenderService {
                     column.x() + 0.5D,
                     column.z() + 0.5D,
                     simulationTick,
-                    waveModel.shorelineFactor(column.waterDepth())
+                    waveModel.shorelineFactor(column.waterDepth()),
+                    storming,
+                    driftAngle
             );
-                final ShoreDirectionBias shoreBias = resolveShoreDirectionBias(player.getWorld(), column, simulationTick);
-                final double[] waveDirection = blendDriftWithShoreDirection(driftAngle, shoreBias);
+            final ShoreDirectionBias shoreBias = resolveShoreDirectionBias(player.getWorld(), column, simulationTick);
+            final double[] waveDirection = blendDriftWithShoreDirection(driftAngle, shoreBias);
             final long columnKey = columnKey(column.x(), column.z());
             double targetVisualHeight = computeCoherentVisualHeight(
                     profile,
@@ -401,7 +407,8 @@ public final class WaveRenderService {
                     edgeBlend,
                     visualCap,
                     driftAngle,
-                    shoreBias
+                    shoreBias,
+                    storming
             );
             final double crestCoverage = crestCoverageGate(profile, sample);
             if (crestCoverage <= 0.005D) {
@@ -454,13 +461,16 @@ public final class WaveRenderService {
             } else if (distNorm > 0.70D) {
                 steps = Math.min(2, steps);
             }
+            // Storm: cap at 1 step — prevents stacked block columns that look blocky.
+            // Single-step waves with Levelled water data give smooth undulation in rain.
             if (storming) {
-                steps = Math.min(3, steps);
+                steps = Math.min(1, steps);
             }
-            if (shoreBias.bias() >= 0.70D && sample.intensity() > 1.12D && smoothedHeight > 0.17D) {
-                steps = Math.max(steps, 1);
-            }
-            if (shoreBias.shorelineDistance() <= 2) {
+            // At the very shore edge, suppress waves completely (distance=1) or cap to 1 (distance 2-3).
+            final int shorelineDistance = shoreBias.shorelineDistance();
+            if (shorelineDistance <= 1) {
+                steps = 0;
+            } else if (shorelineDistance <= 3) {
                 steps = Math.min(1, steps);
             }
             state.putColumnVisualState(columnKey, smoothedHeight, steps, simulationTick);
@@ -477,21 +487,31 @@ public final class WaveRenderService {
                     if (shouldSkipForBoatEnvelope(boatX, boatY, boatZ, column.x(), y, column.z())) {
                         continue;
                     }
-                        final String fakeData = level == steps
-                            ? crestTopVisualWaterData(smoothedHeight, steps, visualCap)
-                            : null;
+                    final String fakeData;
+                    if (level == steps) {
+                        if (shorelineDistance == 2 || shorelineDistance == 3) {
+                            // Near shore: use a shallow Levelled water level so the wave
+                            // tapers to a thin wash rather than a full-height block.
+                            final int shoreLevel = shorelineDistance == 2 ? 7 : 5;
+                            fakeData = flowingWaterVisualData(shoreLevel);
+                        } else {
+                            fakeData = crestTopVisualWaterData(smoothedHeight, steps, visualCap);
+                        }
+                    } else {
+                        fakeData = null;
+                    }
                     desired.put(
                             BlockPosUtil.pack(column.x(), y, column.z()),
                             new FakeBlockState(Material.WATER, restore, fakeData)
                     );
                 }
 
-                if (seafoamBudget > 0 || stormSprayBudget > 0) {
+                if (seafoamBudget > 0 || stormSprayBudget > 0 || crestGlintBudget > 0) {
                     final double crestFront = crestFrontFactor(
-                            profile, column, sample, simulationTick, waveDirection[0], waveDirection[1]);
+                            profile, column, sample, simulationTick, waveDirection[0], waveDirection[1], storming);
                     if (seafoamBudget > 0
-                            && shouldSpawnSeaFoam(column, sample, simulationTick, edgeBlend, distSq, radiusSq, crestFront)) {
-                        spawnSeaFoamParticles(
+                            && particles.shouldSpawnSeaFoam(column, sample, simulationTick, edgeBlend, distSq, radiusSq, crestFront)) {
+                        particles.spawnSeaFoam(
                                 player,
                                 column.x(),
                                 column.y() + steps,
@@ -502,9 +522,21 @@ public final class WaveRenderService {
                         );
                         seafoamBudget--;
                     }
+                    if (crestGlintBudget > 0
+                            && particles.shouldSpawnCrestGlint(sample, edgeBlend, distSq, radiusSq, crestFront)) {
+                        particles.spawnCrestGlint(
+                                player,
+                                column.x(),
+                                column.y() + steps,
+                                column.z(),
+                                waveDirection[0],
+                                waveDirection[1]
+                        );
+                        crestGlintBudget--;
+                    }
                     if (stormSprayBudget > 0
-                            && shouldSpawnStormSpray(column, sample, simulationTick, edgeBlend, distSq, radiusSq, crestFront)) {
-                        spawnStormCrestSprayParticles(
+                            && particles.shouldSpawnStormSpray(column, sample, simulationTick, edgeBlend, distSq, radiusSq, crestFront)) {
+                        particles.spawnStormCrestSpray(
                                 player,
                                 column.x(),
                                 column.y() + steps,
@@ -518,13 +550,42 @@ public final class WaveRenderService {
                 }
 
                 registerShoreRunups(player, column, sample, steps, simulationTick);
+                waveTopByXZ.put(columnKey, column.y() + steps);
             }
 
             if (rainRippleBudget > 0
-                    && shouldSpawnRainRipple(column, sample, simulationTick, edgeBlend, distSq, radiusSq, storming)) {
-                spawnRainRippleParticles(player, column.x(), column.y() + 1, column.z(), storming);
+                    && particles.shouldSpawnRainRipple(column, sample, simulationTick, edgeBlend, distSq, radiusSq, storming)) {
+                particles.spawnRainRipple(player, column.x(), column.y() + 1, column.z(), storming);
                 rainRippleBudget--;
             }
+        }
+
+        // Remove isolated wave columns — a column with zero elevated neighbors looks like a stray spike.
+        // Require at least 1 cardinal neighbor also present in waveTopByXZ before rendering.
+        if (waveTopByXZ.size() > 1) {
+            final Set<Long> isolatedXZ = new HashSet<>();
+            for (final long xzKey : waveTopByXZ.keySet()) {
+                final int cx = (int) (xzKey >> 32);
+                final int cz = (int) (xzKey);
+                if (!waveTopByXZ.containsKey(columnKey(cx + 1, cz))
+                        && !waveTopByXZ.containsKey(columnKey(cx - 1, cz))
+                        && !waveTopByXZ.containsKey(columnKey(cx, cz + 1))
+                        && !waveTopByXZ.containsKey(columnKey(cx, cz - 1))) {
+                    isolatedXZ.add(xzKey);
+                }
+            }
+            if (!isolatedXZ.isEmpty()) {
+                desired.keySet().removeIf(packed -> {
+                    final int px = BlockPosUtil.unpackX(packed);
+                    final int pz = BlockPosUtil.unpackZ(packed);
+                    return isolatedXZ.contains(columnKey(px, pz));
+                });
+                waveTopByXZ.keySet().removeAll(isolatedXZ);
+            }
+        }
+
+        if (!waveTopByXZ.isEmpty()) {
+            boatLifter.liftNearby(player, waveTopByXZ, effectiveRenderRadius);
         }
         state.pruneColumnVisualState(simulationTick - COLUMN_VISUAL_MEMORY_TICKS);
         renderActiveShoreRunups(
@@ -710,7 +771,7 @@ public final class WaveRenderService {
             final int crestSteps,
             final long simulationTick
     ) {
-        if (sample.visualBand() <= 0 || sample.rawHeight() <= 0.0D || sample.intensity() < 0.92D) {
+        if (sample.visualBand() <= 0 || sample.rawHeight() <= 0.0D || sample.intensity() < 1.30D) {
             return;
         }
         final int runupDistance = computeRunupDistance(sample, crestSteps);
@@ -803,7 +864,7 @@ public final class WaveRenderService {
 
             if (!runup.impactParticleSent && particleBudget > 0) {
                 final RunupNode impact = runup.path.get(0);
-                spawnShoreImpactParticles(player, impact.x(), impact.baseY(), impact.z(), runup.intensity);
+                particles.spawnShoreImpact(player, impact.x(), impact.baseY(), impact.z(), runup.intensity);
                 runup.impactParticleSent = true;
                 particleBudget--;
             }
@@ -1085,10 +1146,16 @@ public final class WaveRenderService {
             final int chunkX = (int) (entry.getKey() >> 32);
             final int chunkZ = (int) (long) entry.getKey();
             final List<PhysicalShorePlacement> batch = entry.getValue();
+            // Sort low-Y first so that when two placements are stacked, the lower one
+            // is placed first and the Y-1 validation for the upper one finds real water.
+            batch.sort(java.util.Comparator.comparingInt(PhysicalShorePlacement::y));
             scheduler.runRegion(world, chunkX, chunkZ, () -> {
                 if (!isChunkLoaded(world, chunkX << 4, chunkZ << 4)) {
                     return;
                 }
+                // Tracks positions placed in this batch so stacked placements can
+                // validate against cells placed moments earlier in the same pass.
+                final Set<Long> placedInBatch = new HashSet<>();
                 for (final PhysicalShorePlacement placement : batch) {
                     if (!isChunkLoaded(world, placement.x(), placement.z())) {
                         continue;
@@ -1100,6 +1167,19 @@ public final class WaveRenderService {
                         continue;
                     }
                     if (!isAirLike(current) && !isWaterVegetation(current)) {
+                        continue;
+                    }
+
+                    // Bug 3 fix: reject placements where Y-1 is air. This prevents
+                    // runup-convergence from building floating water-column skyscrapers.
+                    // A placement is allowed if Y-1 is solid, water, or was placed by
+                    // an earlier entry in this same batch (valid stacking).
+                    final long belowPacked = BlockPosUtil.pack(placement.x(), placement.y() - 1, placement.z());
+                    final Block blockBelow = world.getBlockAt(placement.x(), placement.y() - 1, placement.z());
+                    final boolean belowValid = blockBelow.getType().isSolid()
+                            || isWaterBodyMaterial(blockBelow.getType())
+                            || placedInBatch.contains(belowPacked);
+                    if (!belowValid) {
                         continue;
                     }
 
@@ -1128,6 +1208,7 @@ public final class WaveRenderService {
                     if (!block.getBlockData().matches(targetData)) {
                         block.setBlockData(targetData, false);
                     }
+                    placedInBatch.add(BlockPosUtil.pack(placement.x(), placement.y(), placement.z()));
                 }
             });
         }
@@ -1195,6 +1276,23 @@ public final class WaveRenderService {
                     }
                     physicalShoreCells.remove(key);
                     physicalCellRefractoryUntil.put(key, simulationTick + PHYSICAL_CELL_REFRACTORY_TICKS);
+
+                    // Bug 3 sanity: cascade upward — if a cell sits directly above the
+                    // one we just restored it is now floating over air; remove it too.
+                    final PhysicalCellKey aboveKey = new PhysicalCellKey(key.worldId(), key.x(), key.y() + 1, key.z());
+                    final PhysicalShoreCell aboveCell = physicalShoreCells.get(aboveKey);
+                    if (aboveCell != null) {
+                        final Block aboveBlock = world.getBlockAt(key.x(), key.y() + 1, key.z());
+                        if (isWaterBodyMaterial(aboveBlock.getType()) || isWaterVegetation(aboveBlock.getType())) {
+                            try {
+                                aboveBlock.setBlockData(Bukkit.createBlockData(aboveCell.originalBlockData()), false);
+                            } catch (final IllegalArgumentException ignored2) {
+                                aboveBlock.setType(Material.AIR, false);
+                            }
+                        }
+                        physicalShoreCells.remove(aboveKey);
+                        physicalCellRefractoryUntil.put(aboveKey, simulationTick + PHYSICAL_CELL_REFRACTORY_TICKS);
+                    }
                 }
             });
         }
@@ -1266,153 +1364,6 @@ public final class WaveRenderService {
         physicalCellRefractoryUntil.clear();
     }
 
-    private void spawnShoreImpactParticles(
-            final Player player,
-            final int x,
-            final int y,
-            final int z,
-            final double intensity
-    ) {
-        final boolean storming = player.getWorld().isThundering();
-        final int cloudCount = intensity >= 2.0D ? (storming ? 6 : 4) : (storming ? 3 : 2);
-        player.spawnParticle(Particle.CLOUD, x + 0.5D, y + 0.10D, z + 0.5D, cloudCount, 0.28D, 0.08D, 0.28D, 0.005D);
-    }
-
-    private void spawnRainRippleParticles(
-            final Player player,
-            final int x,
-            final int y,
-            final int z,
-            final boolean heavy
-    ) {
-        final int rainCount = heavy ? 2 : 1;
-        player.spawnParticle(Particle.RAIN, x + 0.5D, y + 0.05D, z + 0.5D, rainCount, 0.20D, 0.01D, 0.20D, 0.0D);
-    }
-
-    private void spawnStormCrestSprayParticles(
-            final Player player,
-            final int x,
-            final int y,
-            final int z,
-            final double intensity,
-            final double dirX,
-            final double dirZ
-        ) {
-        final double nx = -dirZ;
-        final double nz = dirX;
-        final int cloudCount = intensity >= 1.8D ? 4 : 3;
-        player.spawnParticle(
-            Particle.CLOUD,
-            x + 0.5D + (nx * 0.20D),
-            y + 0.14D,
-            z + 0.5D + (nz * 0.20D),
-            cloudCount,
-            0.24D,
-            0.07D,
-            0.24D,
-            0.006D
-        );
-    }
-
-    private void spawnSeaFoamParticles(
-            final Player player,
-            final int x,
-            final int y,
-            final int z,
-            final double intensity,
-            final double dirX,
-            final double dirZ
-    ) {
-        final int cloudCount = intensity >= 1.4D ? 6 : 3;
-        final double nx = -dirZ;
-        final double nz = dirX;
-        player.spawnParticle(
-            Particle.CLOUD,
-            x + 0.5D + (nx * 0.28D),
-            y + 0.01D,
-            z + 0.5D + (nz * 0.28D),
-            cloudCount,
-            0.20D,
-            0.010D,
-            0.20D,
-            0.004D
-        );
-    }
-
-    private boolean shouldSpawnSeaFoam(
-            final SurfaceColumn column,
-            final WaveSample sample,
-            final long simulationTick,
-            final double edgeBlend,
-            final int distSq,
-            final int radiusSq,
-            final double crestFront
-    ) {
-        if (sample.visualBand() <= 0
-            || sample.intensity() < 0.75D
-                || edgeBlend < 0.14D
-                || sample.sporadicGate() < 0.35D
-            || crestFront < 0.30D) {
-            return false;
-        }
-        final double normalizedDistance = Math.sqrt(distSq / Math.max(1.0D, (double) radiusSq));
-        final double centerWeight = 1.0D - clamp(normalizedDistance, 0.0D, 1.0D);
-        final double threshold = 0.40D - (centerWeight * 0.14D);
-        return seaFoamNoise(column.x(), column.z(), simulationTick) >= threshold;
-    }
-
-    private boolean shouldSpawnRainRipple(
-            final SurfaceColumn column,
-            final WaveSample sample,
-            final long simulationTick,
-            final double edgeBlend,
-            final int distSq,
-            final int radiusSq,
-            final boolean heavy
-    ) {
-        if (edgeBlend < 0.25D || sample.shorelineFactor() < 0.20D) {
-            return false;
-        }
-        final double normalizedDistance = Math.sqrt(distSq / Math.max(1.0D, (double) radiusSq));
-        final double centerWeight = 1.0D - clamp(normalizedDistance, 0.0D, 1.0D);
-        final double baseThreshold = heavy ? 0.58D : 0.66D;
-        final double threshold = baseThreshold - (centerWeight * 0.12D);
-        return seaFoamNoise(column.x() + 19, column.z() - 31, simulationTick / (heavy ? 2L : 3L)) >= threshold;
-    }
-
-    private boolean shouldSpawnStormSpray(
-            final SurfaceColumn column,
-            final WaveSample sample,
-            final long simulationTick,
-            final double edgeBlend,
-            final int distSq,
-            final int radiusSq,
-            final double crestFront
-    ) {
-        if (sample.visualBand() <= 0
-                || sample.intensity() < 1.22D
-                || edgeBlend < 0.30D
-                || crestFront < 0.60D) {
-            return false;
-        }
-        final double normalizedDistance = Math.sqrt(distSq / Math.max(1.0D, (double) radiusSq));
-        final double centerWeight = 1.0D - clamp(normalizedDistance, 0.0D, 1.0D);
-        final double threshold = 0.64D - (centerWeight * 0.10D);
-        return seaFoamNoise(column.x() - 7, column.z() + 13, simulationTick / 2L) >= threshold;
-    }
-
-    private double seaFoamNoise(final int x, final int z, final long simulationTick) {
-        long n = 1469598103934665603L;
-        n ^= (long) x * 0x9E3779B97F4A7C15L;
-        n *= 1099511628211L;
-        n ^= (long) z * 0xC2B2AE3D27D4EB4FL;
-        n *= 1099511628211L;
-        n ^= (simulationTick / 3L) * 0x165667B19E3779F9L;
-        n *= 1099511628211L;
-        final long bits = (n >>> 11) & ((1L << 53) - 1);
-        return bits / (double) (1L << 53);
-    }
-
     private int findShoreGroundY(final World world, final int x, final int nearSurfaceY, final int z) {
         if (!isChunkLoaded(world, x, z)) {
             return Integer.MIN_VALUE;
@@ -1465,10 +1416,11 @@ public final class WaveRenderService {
         final double speedFactor = clamp(profile.speed() / 1.8D, 0.0D, 1.0D);
         final double delta = targetHeight - previousHeight;
         final double riseAlpha = 0.22D + (speedFactor * 0.10D);
-        final double fallAlpha = 0.14D + (speedFactor * 0.06D);
+        // Faster fall so waves don't linger as frozen blocks after the crest passes.
+        final double fallAlpha = 0.28D + (speedFactor * 0.10D);
         final double alpha = delta >= 0.0D ? riseAlpha : fallAlpha;
         final double maxRiseStep = 0.16D + (speedFactor * 0.08D);
-        final double maxFallStep = 0.12D + (speedFactor * 0.06D);
+        final double maxFallStep = 0.22D + (speedFactor * 0.08D);
         double clampedDelta = clamp(delta, -maxFallStep, maxRiseStep);
         if (delta > 0.0D && previousHeight < 0.05D && targetHeight < 0.20D) {
             clampedDelta = Math.min(clampedDelta, 0.06D + (speedFactor * 0.03D));
@@ -1480,29 +1432,35 @@ public final class WaveRenderService {
         return smoothed;
     }
 
-        private double crestFrontFactor(
+    private double crestFrontFactor(
             final WaveProfile profile,
             final SurfaceColumn column,
             final WaveSample center,
             final long simulationTick,
             final double dirX,
-            final double dirZ
-        ) {
+            final double dirZ,
+            final boolean storming
+    ) {
         final double shore = waveModel.shorelineFactor(column.waterDepth());
+        final double driftAngle = center.windAngle();
         final double spacing = 1.05D;
         final WaveSample behind = waveModel.sample(
             profile,
             column.x() + 0.5D - (dirX * spacing),
             column.z() + 0.5D - (dirZ * spacing),
             simulationTick,
-            shore
+            shore,
+            storming,
+            driftAngle
         );
         final WaveSample previous = waveModel.sample(
             profile,
             column.x() + 0.5D,
             column.z() + 0.5D,
             simulationTick - 2L,
-            shore
+            shore,
+            storming,
+            driftAngle
         );
 
         final double along = center.rawHeight() - behind.rawHeight();
@@ -1510,7 +1468,7 @@ public final class WaveRenderService {
         final double gate = center.sporadicGate();
         final double combined = (along * 1.45D) + (temporal * 0.85D) + ((gate - 0.5D) * 0.24D);
         return clamp((combined + 0.28D) / 0.78D, 0.0D, 1.0D);
-        }
+    }
 
     private double computeCoherentVisualHeight(
             final WaveProfile profile,
@@ -1520,7 +1478,8 @@ public final class WaveRenderService {
             final double edgeBlend,
             final double visualCap,
             final double driftAngle,
-            final ShoreDirectionBias shoreBias
+            final ShoreDirectionBias shoreBias,
+            final boolean storming
     ) {
         final double center = Math.max(
                 0.0D,
@@ -1541,21 +1500,29 @@ public final class WaveRenderService {
                 column.x() + 0.5D + (dirX * spacing),
                 column.z() + 0.5D + (dirZ * spacing),
                 simulationTick,
-                shore
+                shore,
+                storming,
+                driftAngle
         );
         final WaveSample trailSample = waveModel.sample(
                 profile,
                 column.x() + 0.5D - (dirX * spacing),
                 column.z() + 0.5D - (dirZ * spacing),
                 simulationTick,
-                shore
+                shore,
+                storming,
+                driftAngle
         );
 
         final double lead = Math.max(0.0D, waveModel.effectiveVisualHeight(profile, leadSample.rawHeight(), visualCap));
         final double trail = Math.max(0.0D, waveModel.effectiveVisualHeight(profile, trailSample.rawHeight(), visualCap));
         final double neighborAverage = (lead + trail) * 0.5D;
 
-        double coherent = (center * 0.58D) + (neighborAverage * 0.42D);
+        // In storm mode, lean more on neighbour average to spread out isolated spikes —
+        // this prevents single-column high steps that look blocky during rain.
+        double coherent = storming
+                ? (center * 0.40D) + (neighborAverage * 0.60D)
+                : (center * 0.58D) + (neighborAverage * 0.42D);
         if (center > (neighborAverage * 1.45D) && centerSample.intensity() > 1.1D) {
             coherent *= 0.86D;
         } else if (neighborAverage > (center * 1.15D) && centerSample.intensity() > 0.9D) {
@@ -1620,17 +1587,28 @@ public final class WaveRenderService {
         }
         final int distance = clamp(shoreBias.shorelineDistance(), 1, 32);
 
+        // At the very edge (distance=1) suppress entirely — waves are already blocked by step clamp above,
+        // but returning 0 here prevents any height leaking through other paths.
+        if (distance <= 1) {
+            return 0.0D;
+        }
+
         final double shoal = 1.0D - smoothStep(4.0D, 24.0D, distance);
-        final double collapse = smoothStep(1.0D, 4.0D, (double) distance);
+        final double collapse = smoothStep(2.0D, 5.0D, (double) distance);
 
         final double speedFactor = clamp(profile.speed() / 2.6D, 0.18D, 1.0D);
         final double frequencyFactor = clamp(profile.frequency() / 2.0D, 0.20D, 1.0D);
-        final double phase = (distance * 0.35D) - ((simulationTick / 20.0D) * (0.72D + (speedFactor * 1.10D)));
+        // Slow the shore pulse rate and reduce amplitude swing — prevents the "bouncy" look.
+        // Phase advances slower (0.42 instead of 0.72) and the train modulation is narrower.
+        final double phase = (distance * 0.35D) - ((simulationTick / 20.0D) * (0.42D + (speedFactor * 0.55D)));
         final double train = smoothStep(0.30D, 0.85D, 0.5D + (0.5D * Math.sin(phase)));
 
         final double base = 0.44D + (shoal * 0.46D);
-        final double shaped = base * collapse * (0.52D + (0.48D * train));
-        final double floor = 0.26D + (shoreBias.bias() * 0.10D) + (frequencyFactor * 0.04D);
+        // Narrower swing (0.78 + 0.22 * train) instead of (0.52 + 0.48 * train) — the shore
+        // envelope stays consistently present and fades naturally rather than pulsing on/off.
+        final double shaped = base * collapse * (0.78D + (0.22D * train));
+        // Reduced floor — less residual wave energy pinning near the shoreline.
+        final double floor = 0.06D + (frequencyFactor * 0.03D);
         return clamp(Math.max(floor, shaped), 0.0D, 1.0D);
     }
 
@@ -1655,6 +1633,10 @@ public final class WaveRenderService {
     }
 
     private int dampStepTransition(final int previousStep, final int targetStep, final double smoothedHeight) {
+        // If the height is negligible, allow immediate drop to zero regardless of previous step.
+        if (previousStep > 0 && smoothedHeight < 0.022D) {
+            return 0;
+        }
         if (previousStep == 0 && targetStep > 0 && smoothedHeight < 0.08D) {
             return 0;
         }
@@ -1664,7 +1646,8 @@ public final class WaveRenderService {
         if (targetStep < previousStep - 1) {
             return previousStep - 1;
         }
-        if (previousStep > 0 && targetStep == 0 && smoothedHeight > 0.07D) {
+        // Lower threshold (0.04 vs 0.07) so the fallback to step=1 clears sooner.
+        if (previousStep > 0 && targetStep == 0 && smoothedHeight > 0.04D) {
             return 1;
         }
         return targetStep;

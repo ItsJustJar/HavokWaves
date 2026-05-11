@@ -7,6 +7,7 @@ import java.util.function.Consumer;
 import java.util.logging.Level;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -61,10 +62,18 @@ public final class FoliaSchedulerAdapter implements ServerScheduler {
         if (!player.isOnline()) {
             return;
         }
-        try {
-            final Object entityScheduler = invokeNoArgs(player, "getScheduler");
+        runEntity(player, runnable);
+    }
 
-            Method runMethod = findMethod(entityScheduler.getClass(), "run", 3);
+    @Override
+    public void runEntity(final Entity entity, final Runnable runnable) {
+        if (!entity.isValid()) {
+            return;
+        }
+        try {
+            final Object entityScheduler = invokeNoArgs(entity, "getScheduler");
+
+            final Method runMethod = findMethod(entityScheduler.getClass(), "run", 3);
             if (runMethod != null) {
                 runMethod.invoke(entityScheduler, plugin, (Consumer<Object>) ignored -> runnable.run(), null);
                 return;

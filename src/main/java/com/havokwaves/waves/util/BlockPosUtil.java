@@ -37,4 +37,8 @@ public final class BlockPosUtil {
         }
         return z;
     }
+
+    public static long columnKey(final int x, final int z) {
+        return (((long) x) << 32) ^ (z & 0xFFFFFFFFL);
+    }
 }

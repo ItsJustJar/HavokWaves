@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -35,6 +36,14 @@ public final class PaperSchedulerAdapter implements ServerScheduler {
     @Override
     public void runPlayer(final Player player, final Runnable runnable) {
         if (!player.isOnline()) {
+            return;
+        }
+        Bukkit.getScheduler().runTask(plugin, runnable);
+    }
+
+    @Override
+    public void runEntity(final Entity entity, final Runnable runnable) {
+        if (!entity.isValid()) {
             return;
         }
         Bukkit.getScheduler().runTask(plugin, runnable);
