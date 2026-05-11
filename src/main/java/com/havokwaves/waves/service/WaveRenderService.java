@@ -70,6 +70,7 @@ public final class WaveRenderService {
     private final BoatLifter boatLifter;
     private final WaveParticleEmitter particles;
     private final WaterFlowFactory waterFlow;
+    private final BiomeFetchSampler biomeFetch;
     private final Map<UUID, PlayerWaveState> playerStates = new ConcurrentHashMap<>();
     private final Map<UUID, Map<Long, ShoreRunupState>> playerRunups = new ConcurrentHashMap<>();
     private final Map<ChunkCacheKey, ChunkSurfaceCache> chunkSurfaceCache = new ConcurrentHashMap<>();
@@ -94,6 +95,7 @@ public final class WaveRenderService {
         this.boatLifter = new BoatLifter(scheduler);
         this.particles = new WaveParticleEmitter();
         this.waterFlow = new WaterFlowFactory();
+        this.biomeFetch = new BiomeFetchSampler(configSupplier);
     }
 
     public void tickPlayer(final Player player, final long simulationTick) {
@@ -339,7 +341,7 @@ public final class WaveRenderService {
             final int surfaceWaterY = resolveSurfaceWaterY(world, x, y, z, floor);
             if (surfaceWaterY != Integer.MIN_VALUE) {
                 final int depth = waterDepthAt(world, x, surfaceWaterY, z);
-                if (!isOceanWaveArea(world, x, surfaceWaterY, z, depth)) {
+                if (!biomeFetch.isOceanWaveArea(world, x, surfaceWaterY, z, depth)) {
                     continue;
                 }
                 return new SurfaceColumn(x, surfaceWaterY, z, depth);
@@ -1815,82 +1817,6 @@ public final class WaveRenderService {
             return isAirLike(above);
         }
         return false;
-    }
-
-    private boolean isOceanWaveArea(
-            final World world,
-            final int x,
-            final int y,
-            final int z,
-            final int depth
-    ) {
-        if (depth < 1) {
-            return false;
-        }
-        final PluginConfig config = configSupplier.get();
-        if (config.isBiomeAllowed(world.getBiome(x, y, z))) {
-            return true;
-        }
-        if (!hasNearbyAllowedBiome(world, x, y, z, 10, config)) {
-            return false;
-        }
-        return hasOpenWaterFetch(world, x, y, z, 8);
-    }
-
-    private boolean hasNearbyAllowedBiome(
-            final World world,
-            final int x,
-            final int y,
-            final int z,
-            final int radius,
-            final PluginConfig config
-    ) {
-        for (int dx = -radius; dx <= radius; dx += 2) {
-            for (int dz = -radius; dz <= radius; dz += 2) {
-                if (!isChunkLoaded(world, x + dx, z + dz)) {
-                    continue;
-                }
-                if ((dx * dx) + (dz * dz) > (radius * radius)) {
-                    continue;
-                }
-                if (config.isBiomeAllowed(world.getBiome(x + dx, y, z + dz))) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private boolean hasOpenWaterFetch(
-            final World world,
-            final int x,
-            final int y,
-            final int z,
-            final int radius
-    ) {
-        int waterColumns = 0;
-        int sampled = 0;
-        for (int dx = -radius; dx <= radius; dx += 2) {
-            for (int dz = -radius; dz <= radius; dz += 2) {
-                if ((dx * dx) + (dz * dz) > (radius * radius)) {
-                    continue;
-                }
-                final int cx = x + dx;
-                final int cz = z + dz;
-                if (!isChunkLoaded(world, cx, cz)) {
-                    continue;
-                }
-                sampled++;
-                if (isWater(world.getBlockAt(cx, y, cz).getType())) {
-                    waterColumns++;
-                }
-            }
-        }
-        if (sampled < 10) {
-            return false;
-        }
-        final double ratio = waterColumns / (double) sampled;
-        return ratio >= 0.55D;
     }
 
     private int resolveSurfaceWaterY(final World world, final int x, final int y, final int z, final int floor) {
