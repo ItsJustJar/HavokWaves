@@ -50,10 +50,6 @@ public final class WaveRenderService {
     private static final long VISUAL_STICKY_TICKS = 12L;
     private static final long SHORE_DIRECTION_CACHE_TTL_TICKS = 600L;
     private static final long COLUMN_VISUAL_MEMORY_TICKS = 220L;
-    private static final long PHYSICAL_CELL_BASE_TTL_TICKS = 40L;
-    private static final long PHYSICAL_CLEANUP_INTERVAL_TICKS = 8L;
-    private static final long PHYSICAL_CELL_MAX_LIFETIME_TICKS = 80L;
-    private static final long PHYSICAL_CELL_REFRACTORY_TICKS = 18L;
     private static final int RENDER_EDGE_BLEND_BLOCKS = 20;
     private static final int MAX_SHORE_DIRECTIONS_PER_COLUMN = 1;
     private static final int MAX_RUNUPS_PER_PLAYER = 192;
@@ -77,11 +73,8 @@ public final class WaveRenderService {
     private final ChunkSurfaceScanner surfaceScanner;
     private final Map<UUID, PlayerWaveState> playerStates = new ConcurrentHashMap<>();
     private final Map<UUID, Map<Long, ShoreRunupState>> playerRunups = new ConcurrentHashMap<>();
-    private final Map<PhysicalCellKey, PhysicalShoreCell> physicalShoreCells = new ConcurrentHashMap<>();
-    private final Map<PhysicalCellKey, Long> physicalCellRefractoryUntil = new ConcurrentHashMap<>();
     private final Map<ShoreColumnKey, CachedShoreDirection> shoreDirectionCache = new ConcurrentHashMap<>();
     private volatile long lastChunkCacheCleanupTick = Long.MIN_VALUE;
-    private volatile long lastPhysicalCleanupTick = Long.MIN_VALUE;
 
     public WaveRenderService(
             final ServerScheduler scheduler,
@@ -127,7 +120,6 @@ public final class WaveRenderService {
     }
 
     public void tickGlobal(final long simulationTick) {
-        cleanupExpiredPhysicalShoreCells(simulationTick);
     }
 
     public void markDirty(final Player player) {
@@ -159,8 +151,6 @@ public final class WaveRenderService {
         }
         surfaceScanner.clear();
         shoreDirectionCache.clear();
-        restoreAllPhysicalShoreCells();
-        physicalCellRefractoryUntil.clear();
     }
 
     public void clearPlayer(final Player player) {
@@ -188,20 +178,10 @@ public final class WaveRenderService {
         playerRunups.clear();
         surfaceScanner.clear();
         shoreDirectionCache.clear();
-        restoreAllPhysicalShoreCells();
-        physicalCellRefractoryUntil.clear();
     }
 
     public void clearAllImmediate() {
-        for (final Player player : Bukkit.getOnlinePlayers()) {
-            clearPlayer(player);
-        }
-        playerStates.clear();
-        playerRunups.clear();
-        surfaceScanner.clear();
-        shoreDirectionCache.clear();
-        restoreAllPhysicalShoreCellsImmediate();
-        physicalCellRefractoryUntil.clear();
+        clearAll();
     }
 
     private void requestSurfaceScan(
@@ -281,7 +261,6 @@ public final class WaveRenderService {
         columns.sort(Comparator.comparingInt(column -> distanceSquared(column.x(), column.z(), renderCenterX, renderCenterZ)));
         final Map<Long, FakeBlockState> desired = new LinkedHashMap<>(Math.max(16, columns.size() / 2));
         final Map<Long, Integer> waveTopByXZ = new HashMap<>();
-        final List<PhysicalShorePlacement> physicalPlacements = new ArrayList<>();
         int seafoamBudget = WaveParticleEmitter.SEAFOAM_BUDGET_PER_TICK;
         int crestGlintBudget = WaveParticleEmitter.CREST_GLINT_BUDGET_PER_TICK;
         int rainRippleBudget = raining ? WaveParticleEmitter.RAIN_RIPPLE_BUDGET_PER_TICK : 0;
@@ -497,14 +476,7 @@ public final class WaveRenderService {
             boatLifter.liftNearby(player, waveTopByXZ, effectiveRenderRadius);
         }
         state.pruneColumnVisualState(simulationTick - COLUMN_VISUAL_MEMORY_TICKS);
-        renderActiveShoreRunups(
-                player,
-                simulationTick,
-                desired,
-                seafoamBudget,
-                physicalPlacements
-        );
-        applyPhysicalShoreWater(player.getWorld(), simulationTick, physicalPlacements);
+        renderActiveShoreRunups(player, simulationTick, desired, seafoamBudget);
 
         final int cap = config.maxBlockUpdatesPerTickPerPlayer();
         synchronized (state) {
@@ -703,8 +675,7 @@ public final class WaveRenderService {
             final Player player,
             final long simulationTick,
             final Map<Long, FakeBlockState> desired,
-            int particleBudget,
-            final List<PhysicalShorePlacement> physicalPlacements
+            int particleBudget
     ) {
         final Map<Long, ShoreRunupState> runups = playerRunups.get(player.getUniqueId());
         if (runups == null || runups.isEmpty()) {
@@ -759,6 +730,7 @@ public final class WaveRenderService {
                 }
 
                 final RunupNode node = runup.path.get(i);
+                final int baseLevel = runupWaterLevel(i, runup.path.size(), globalCollapse);
                 boolean placedAny = false;
                 for (int layer = 0; layer < layers; layer++) {
                     final int y = node.baseY() + layer;
@@ -772,45 +744,31 @@ public final class WaveRenderService {
                         }
                         continue;
                     }
+                    // Upper layers thin out to a wash rather than stacking as full cubes.
+                    final int level = clamp(baseLevel + (layer * 2), 1, 7);
                     desired.put(
                             BlockPosUtil.pack(node.x(), y, node.z()),
-                            new FakeBlockState(Material.WATER, current)
+                            new FakeBlockState(Material.WATER, current, waterFlow.flowingWaterVisualData(level))
                     );
                     placedAny = true;
                 }
-                if (placedAny) {
-                    final int physicalY = node.baseY();
-                    final int waterLevel = physicalWaterLevel(i, runup.path.size(), globalCollapse);
-                    final int ttl = physicalWaterTtl(runup.path.size(), i);
-                    physicalPlacements.add(
-                            new PhysicalShorePlacement(node.x(), physicalY, node.z(), waterLevel, ttl, false)
-                    );
 
-                    if (i == 0) {
-                        final int seaTop = runup.waterSurfaceY + 1;
-                        final int low = Math.min(seaTop, physicalY);
-                        final int high = Math.max(seaTop, physicalY);
-                        for (int yy = low; yy <= high; yy++) {
-                            if (Math.abs(yy - physicalY) > 2) {
-                                continue;
-                            }
-                            final Material connector = world.getBlockAt(node.x(), yy, node.z()).getType();
-                            if (isRunupReplaceable(connector)) {
-                                desired.put(
-                                        BlockPosUtil.pack(node.x(), yy, node.z()),
-                                        new FakeBlockState(Material.WATER, connector)
-                                );
-                                physicalPlacements.add(
-                                        new PhysicalShorePlacement(
-                                                node.x(),
-                                                yy,
-                                                node.z(),
-                                                Math.max(1, waterLevel - 1),
-                                                ttl + 4,
-                                                false
-                                        )
-                                );
-                            }
+                if (placedAny && i == 0) {
+                    final int seaTop = runup.waterSurfaceY + 1;
+                    final int physicalY = node.baseY();
+                    final int low = Math.min(seaTop, physicalY);
+                    final int high = Math.max(seaTop, physicalY);
+                    final int connectorLevel = Math.max(1, baseLevel - 1);
+                    for (int yy = low; yy <= high; yy++) {
+                        if (Math.abs(yy - physicalY) > 2) {
+                            continue;
+                        }
+                        final Material connector = world.getBlockAt(node.x(), yy, node.z()).getType();
+                        if (isRunupReplaceable(connector)) {
+                            desired.put(
+                                    BlockPosUtil.pack(node.x(), yy, node.z()),
+                                    new FakeBlockState(Material.WATER, connector, waterFlow.flowingWaterVisualData(connectorLevel))
+                            );
                         }
                     }
                 }
@@ -821,6 +779,20 @@ public final class WaveRenderService {
             runups.remove(key);
         }
         return particleBudget;
+    }
+
+    private int runupWaterLevel(final int inlandDistance, final int pathSize, final int globalCollapse) {
+        final int waveTail = Math.max(0, pathSize - inlandDistance - 1);
+        int level;
+        if (inlandDistance <= 1 && globalCollapse == 0) {
+            level = 1;
+        } else {
+            level = 1 + Math.min(5, Math.max(0, inlandDistance - 1) + (globalCollapse / 2));
+        }
+        if (waveTail <= 1 && inlandDistance > 0) {
+            level = Math.max(level, 4);
+        }
+        return clamp(level, 1, 7);
     }
 
     private List<RunupNode> buildRunupPath(
@@ -933,26 +905,6 @@ public final class WaveRenderService {
         return Math.max(0, layers);
     }
 
-    private int physicalWaterLevel(final int inlandDistance, final int pathSize, final int globalCollapse) {
-        final int waveTail = Math.max(0, pathSize - inlandDistance - 1);
-        int level;
-        if (inlandDistance <= 1 && globalCollapse == 0) {
-            level = 1;
-        } else {
-            level = 1 + Math.min(5, Math.max(0, inlandDistance - 1) + (globalCollapse / 2));
-        }
-        if (waveTail <= 1 && inlandDistance > 0) {
-            level = Math.max(level, 4);
-        }
-        return clamp(level, 1, 7);
-    }
-
-    private int physicalWaterTtl(final int pathSize, final int inlandDistance) {
-        final int tailFactor = Math.max(0, pathSize - inlandDistance);
-        final int ttl = (int) PHYSICAL_CELL_BASE_TTL_TICKS + Math.min(12, tailFactor * 2);
-        return Math.max(16, ttl);
-    }
-
     private long shorelineKey(final int x, final int y, final int z, final int dirX, final int dirZ) {
         final long packed = BlockPosUtil.pack(x, y, z);
         final long dirCode = (((long) (dirX + 2)) << 3) ^ (dirZ + 2L);
@@ -974,269 +926,6 @@ public final class WaveRenderService {
             }
             runups.remove(oldestKey);
         }
-    }
-
-    private void applyPhysicalShoreWater(
-            final World world,
-            final long simulationTick,
-            final List<PhysicalShorePlacement> placements
-    ) {
-        if (placements.isEmpty()) {
-            return;
-        }
-        final Map<Long, PhysicalShorePlacement> mergedPlacements = new HashMap<>();
-        for (final PhysicalShorePlacement placement : placements) {
-            final long packed = BlockPosUtil.pack(placement.x(), placement.y(), placement.z());
-            final PhysicalShorePlacement existing = mergedPlacements.get(packed);
-            if (existing == null) {
-                mergedPlacements.put(packed, placement);
-                continue;
-            }
-            mergedPlacements.put(
-                    packed,
-                    new PhysicalShorePlacement(
-                            placement.x(),
-                            placement.y(),
-                            placement.z(),
-                            Math.min(existing.level(), placement.level()),
-                            Math.max(existing.ttlTicks(), placement.ttlTicks()),
-                            false
-                    )
-            );
-        }
-
-        final UUID worldId = world.getUID();
-        final Map<Long, List<PhysicalShorePlacement>> chunkBatches = new HashMap<>();
-        for (final PhysicalShorePlacement placement : mergedPlacements.values()) {
-            if (!isChunkLoaded(world, placement.x(), placement.z())) {
-                continue;
-            }
-            final int chunkX = placement.x() >> 4;
-            final int chunkZ = placement.z() >> 4;
-            final long chunkKey = (((long) chunkX) << 32) ^ (chunkZ & 0xFFFFFFFFL);
-            chunkBatches.computeIfAbsent(chunkKey, ignored -> new ArrayList<>()).add(placement);
-        }
-
-        for (final Map.Entry<Long, List<PhysicalShorePlacement>> entry : chunkBatches.entrySet()) {
-            final int chunkX = (int) (entry.getKey() >> 32);
-            final int chunkZ = (int) (long) entry.getKey();
-            final List<PhysicalShorePlacement> batch = entry.getValue();
-            // Sort low-Y first so that when two placements are stacked, the lower one
-            // is placed first and the Y-1 validation for the upper one finds real water.
-            batch.sort(java.util.Comparator.comparingInt(PhysicalShorePlacement::y));
-            scheduler.runRegion(world, chunkX, chunkZ, () -> {
-                if (!isChunkLoaded(world, chunkX << 4, chunkZ << 4)) {
-                    return;
-                }
-                // Tracks positions placed in this batch so stacked placements can
-                // validate against cells placed moments earlier in the same pass.
-                final Set<Long> placedInBatch = new HashSet<>();
-                for (final PhysicalShorePlacement placement : batch) {
-                    if (!isChunkLoaded(world, placement.x(), placement.z())) {
-                        continue;
-                    }
-                    final Block block = world.getBlockAt(placement.x(), placement.y(), placement.z());
-                    final Material current = block.getType();
-                    final boolean waterCell = isWaterBodyMaterial(current);
-                    if (waterCell) {
-                        continue;
-                    }
-                    if (!isAirLike(current) && !isWaterVegetation(current)) {
-                        continue;
-                    }
-
-                    // Bug 3 fix: reject placements where Y-1 is air. This prevents
-                    // runup-convergence from building floating water-column skyscrapers.
-                    // A placement is allowed if Y-1 is solid, water, or was placed by
-                    // an earlier entry in this same batch (valid stacking).
-                    final long belowPacked = BlockPosUtil.pack(placement.x(), placement.y() - 1, placement.z());
-                    final Block blockBelow = world.getBlockAt(placement.x(), placement.y() - 1, placement.z());
-                    final boolean belowValid = blockBelow.getType().isSolid()
-                            || isWaterBodyMaterial(blockBelow.getType())
-                            || placedInBatch.contains(belowPacked);
-                    if (!belowValid) {
-                        continue;
-                    }
-
-                    final PhysicalCellKey key = new PhysicalCellKey(worldId, placement.x(), placement.y(), placement.z());
-                    final Long refractoryUntil = physicalCellRefractoryUntil.get(key);
-                    if (refractoryUntil != null && simulationTick < refractoryUntil) {
-                        continue;
-                    }
-                    final PhysicalShoreCell existing = physicalShoreCells.get(key);
-                    final String originalData = existing == null
-                            ? block.getBlockData().getAsString()
-                            : existing.originalBlockData();
-                    final long createdTick = existing == null ? simulationTick : existing.createdTick();
-                    final long expireTick = simulationTick + placement.ttlTicks();
-                    final long cappedExpire = Math.min(
-                            Math.max(expireTick, existing == null ? 0L : existing.expireTick()),
-                            createdTick + PHYSICAL_CELL_MAX_LIFETIME_TICKS
-                    );
-                    physicalShoreCells.put(
-                            key,
-                            new PhysicalShoreCell(originalData, createdTick, cappedExpire)
-                    );
-
-                    final int level = clamp(placement.level(), 1, 7);
-                    final BlockData targetData = waterFlow.flowingWaterData(level).clone();
-                    if (!block.getBlockData().matches(targetData)) {
-                        block.setBlockData(targetData, false);
-                    }
-                    placedInBatch.add(BlockPosUtil.pack(placement.x(), placement.y(), placement.z()));
-                }
-            });
-        }
-    }
-
-    private void cleanupExpiredPhysicalShoreCells(final long simulationTick) {
-        if (physicalShoreCells.isEmpty()) {
-            if (!physicalCellRefractoryUntil.isEmpty()) {
-                physicalCellRefractoryUntil.entrySet().removeIf(entry -> entry.getValue() <= simulationTick);
-            }
-            return;
-        }
-        if (lastPhysicalCleanupTick != Long.MIN_VALUE
-                && (simulationTick - lastPhysicalCleanupTick) < PHYSICAL_CLEANUP_INTERVAL_TICKS) {
-            return;
-        }
-        lastPhysicalCleanupTick = simulationTick;
-
-        final Map<ChunkCacheKey, List<PhysicalCellKey>> expiredByChunk = new HashMap<>();
-        for (final Map.Entry<PhysicalCellKey, PhysicalShoreCell> entry : physicalShoreCells.entrySet()) {
-            if (entry.getValue().expireTick() > simulationTick) {
-                continue;
-            }
-            final PhysicalCellKey key = entry.getKey();
-            final World world = Bukkit.getWorld(key.worldId());
-            if (world == null) {
-                physicalShoreCells.remove(key);
-                continue;
-            }
-            expiredByChunk.computeIfAbsent(
-                    new ChunkCacheKey(key.worldId(), key.x() >> 4, key.z() >> 4),
-                    ignored -> new ArrayList<>()
-            ).add(key);
-        }
-
-        for (final Map.Entry<ChunkCacheKey, List<PhysicalCellKey>> entry : expiredByChunk.entrySet()) {
-            final ChunkCacheKey chunk = entry.getKey();
-            final World world = Bukkit.getWorld(chunk.worldId());
-            if (world == null) {
-                for (final PhysicalCellKey key : entry.getValue()) {
-                    physicalShoreCells.remove(key);
-                }
-                continue;
-            }
-            final List<PhysicalCellKey> keys = entry.getValue();
-            scheduler.runRegion(world, chunk.chunkX(), chunk.chunkZ(), () -> {
-                for (final PhysicalCellKey key : keys) {
-                    final PhysicalShoreCell cell = physicalShoreCells.get(key);
-                    if (cell == null || cell.expireTick() > simulationTick) {
-                        continue;
-                    }
-                    if (!isChunkLoaded(world, key.x(), key.z())) {
-                        continue;
-                    }
-
-                    final Block block = world.getBlockAt(key.x(), key.y(), key.z());
-                    if (isWaterBodyMaterial(block.getType())
-                            || isWaterVegetation(block.getType())
-                            || block.getType() == Material.BARRIER) {
-                        try {
-                            block.setBlockData(Bukkit.createBlockData(cell.originalBlockData()), false);
-                        } catch (final IllegalArgumentException ignored) {
-                            block.setType(Material.AIR, false);
-                        }
-                    }
-                    physicalShoreCells.remove(key);
-                    physicalCellRefractoryUntil.put(key, simulationTick + PHYSICAL_CELL_REFRACTORY_TICKS);
-
-                    // Bug 3 sanity: cascade upward — if a cell sits directly above the
-                    // one we just restored it is now floating over air; remove it too.
-                    final PhysicalCellKey aboveKey = new PhysicalCellKey(key.worldId(), key.x(), key.y() + 1, key.z());
-                    final PhysicalShoreCell aboveCell = physicalShoreCells.get(aboveKey);
-                    if (aboveCell != null) {
-                        final Block aboveBlock = world.getBlockAt(key.x(), key.y() + 1, key.z());
-                        if (isWaterBodyMaterial(aboveBlock.getType()) || isWaterVegetation(aboveBlock.getType())) {
-                            try {
-                                aboveBlock.setBlockData(Bukkit.createBlockData(aboveCell.originalBlockData()), false);
-                            } catch (final IllegalArgumentException ignored2) {
-                                aboveBlock.setType(Material.AIR, false);
-                            }
-                        }
-                        physicalShoreCells.remove(aboveKey);
-                        physicalCellRefractoryUntil.put(aboveKey, simulationTick + PHYSICAL_CELL_REFRACTORY_TICKS);
-                    }
-                }
-            });
-        }
-
-        if (!physicalCellRefractoryUntil.isEmpty()) {
-            physicalCellRefractoryUntil.entrySet().removeIf(entry -> entry.getValue() <= simulationTick);
-        }
-    }
-
-    private void restoreAllPhysicalShoreCells() {
-        if (physicalShoreCells.isEmpty()) {
-            return;
-        }
-        final List<Map.Entry<PhysicalCellKey, PhysicalShoreCell>> snapshot = new ArrayList<>(physicalShoreCells.entrySet());
-        for (final Map.Entry<PhysicalCellKey, PhysicalShoreCell> entry : snapshot) {
-            final PhysicalCellKey key = entry.getKey();
-            final PhysicalShoreCell cell = entry.getValue();
-            final World world = Bukkit.getWorld(key.worldId());
-            if (world == null) {
-                continue;
-            }
-            scheduler.runRegion(world, key.x() >> 4, key.z() >> 4, () -> {
-                if (!isChunkLoaded(world, key.x(), key.z())) {
-                    return;
-                }
-                final Block block = world.getBlockAt(key.x(), key.y(), key.z());
-                if (isWaterBodyMaterial(block.getType())
-                        || isWaterVegetation(block.getType())
-                        || block.getType() == Material.BARRIER) {
-                    try {
-                        block.setBlockData(Bukkit.createBlockData(cell.originalBlockData()), false);
-                    } catch (final IllegalArgumentException ignored) {
-                        block.setType(Material.AIR, false);
-                    }
-                }
-            });
-        }
-        physicalShoreCells.clear();
-        physicalCellRefractoryUntil.clear();
-    }
-
-    private void restoreAllPhysicalShoreCellsImmediate() {
-        if (physicalShoreCells.isEmpty()) {
-            return;
-        }
-        final List<Map.Entry<PhysicalCellKey, PhysicalShoreCell>> snapshot = new ArrayList<>(physicalShoreCells.entrySet());
-        for (final Map.Entry<PhysicalCellKey, PhysicalShoreCell> entry : snapshot) {
-            final PhysicalCellKey key = entry.getKey();
-            final PhysicalShoreCell cell = entry.getValue();
-            final World world = Bukkit.getWorld(key.worldId());
-            if (world == null) {
-                continue;
-            }
-            if (!isChunkLoaded(world, key.x(), key.z())) {
-                continue;
-            }
-            final Block block = world.getBlockAt(key.x(), key.y(), key.z());
-            if (isWaterBodyMaterial(block.getType())
-                    || isWaterVegetation(block.getType())
-                    || block.getType() == Material.BARRIER) {
-                try {
-                    block.setBlockData(Bukkit.createBlockData(cell.originalBlockData()), false);
-                } catch (final IllegalArgumentException ignored) {
-                    block.setType(Material.AIR, false);
-                }
-            }
-        }
-        physicalShoreCells.clear();
-        physicalCellRefractoryUntil.clear();
     }
 
     private int findShoreGroundY(final World world, final int x, final int nearSurfaceY, final int z) {
@@ -1700,15 +1389,6 @@ public final class WaveRenderService {
             this.lastTriggerTick = startTick;
             this.impactParticleSent = impactParticleSent;
         }
-    }
-
-    private record PhysicalShorePlacement(int x, int y, int z, int level, int ttlTicks, boolean allowWaterOverride) {
-    }
-
-    private record PhysicalCellKey(UUID worldId, int x, int y, int z) {
-    }
-
-    private record PhysicalShoreCell(String originalBlockData, long createdTick, long expireTick) {
     }
 
     private record RunupNode(int x, int z, int baseY) {
