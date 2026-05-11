@@ -35,6 +35,13 @@ import com.havokwaves.waves.util.BlockPosUtil;
 import com.havokwaves.waves.wave.WaveModel;
 import com.havokwaves.waves.wave.WaveModel.WaveSample;
 
+import static com.havokwaves.waves.service.MaterialPredicates.isAirLike;
+import static com.havokwaves.waves.service.MaterialPredicates.isRunupReplaceable;
+import static com.havokwaves.waves.service.MaterialPredicates.isVisualReplaceable;
+import static com.havokwaves.waves.service.MaterialPredicates.isWater;
+import static com.havokwaves.waves.service.MaterialPredicates.isWaterBodyMaterial;
+import static com.havokwaves.waves.service.MaterialPredicates.isWaterVegetation;
+
 public final class WaveRenderService {
     private static final long CHUNK_CACHE_TTL_TICKS = 400L;
     private static final long VISUAL_STICKY_TICKS = 12L;
@@ -709,14 +716,6 @@ public final class WaveRenderService {
         for (final Map.Entry<Long, FakeBlockState> entry : active.entrySet()) {
             sendPacked(player, entry.getKey(), entry.getValue().restoreMaterial());
         }
-    }
-
-    private boolean isAirLike(final Material material) {
-        return material == Material.AIR || material == Material.CAVE_AIR || material == Material.VOID_AIR;
-    }
-
-    private boolean isWater(final Material material) {
-        return isWaterBodyMaterial(material) || isWaterVegetation(material);
     }
 
     private int waterDepthAt(final World world, final int x, final int surfaceY, final int z) {
@@ -1775,14 +1774,6 @@ public final class WaveRenderService {
         return t * t * (3.0D - (2.0D * t));
     }
 
-    private boolean isVisualReplaceable(final Material material) {
-        return isAirLike(material) || isWaterVegetation(material);
-    }
-
-    private boolean isRunupReplaceable(final Material material) {
-        return isAirLike(material) || isWaterVegetation(material) || isWaterBodyMaterial(material);
-    }
-
     private boolean isChunkLoaded(final World world, final int blockX, final int blockZ) {
         return world.isChunkLoaded(blockX >> 4, blockZ >> 4);
     }
@@ -1809,17 +1800,6 @@ public final class WaveRenderService {
                 chunkSurfaceCache.remove(new ChunkCacheKey(worldId, chunkX + dx, chunkZ + dz));
             }
         }
-    }
-
-    private boolean isWaterBodyMaterial(final Material material) {
-        return material == Material.WATER || material == Material.BUBBLE_COLUMN;
-    }
-
-    private boolean isWaterVegetation(final Material material) {
-        return material == Material.KELP
-                || material == Material.KELP_PLANT
-                || material == Material.SEAGRASS
-                || material == Material.TALL_SEAGRASS;
     }
 
     private boolean isSurfaceOpenAbove(final World world, final int x, final int y, final int z) {
