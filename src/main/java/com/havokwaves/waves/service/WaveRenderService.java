@@ -47,7 +47,6 @@ import static com.havokwaves.waves.service.WorldProbes.resolveSurfaceWaterY;
 import static com.havokwaves.waves.service.WorldProbes.waterDepthAt;
 
 public final class WaveRenderService {
-    private static final long CHUNK_CACHE_TTL_TICKS = 400L;
     private static final long VISUAL_STICKY_TICKS = 12L;
     private static final long SHORE_DIRECTION_CACHE_TTL_TICKS = 600L;
     private static final long COLUMN_VISUAL_MEMORY_TICKS = 220L;
@@ -75,9 +74,9 @@ public final class WaveRenderService {
     private final WaveParticleEmitter particles;
     private final WaterFlowFactory waterFlow;
     private final BiomeFetchSampler biomeFetch;
+    private final ChunkSurfaceScanner surfaceScanner;
     private final Map<UUID, PlayerWaveState> playerStates = new ConcurrentHashMap<>();
     private final Map<UUID, Map<Long, ShoreRunupState>> playerRunups = new ConcurrentHashMap<>();
-    private final Map<ChunkCacheKey, ChunkSurfaceCache> chunkSurfaceCache = new ConcurrentHashMap<>();
     private final Map<PhysicalCellKey, PhysicalShoreCell> physicalShoreCells = new ConcurrentHashMap<>();
     private final Map<PhysicalCellKey, Long> physicalCellRefractoryUntil = new ConcurrentHashMap<>();
     private final Map<ShoreColumnKey, CachedShoreDirection> shoreDirectionCache = new ConcurrentHashMap<>();
@@ -100,6 +99,7 @@ public final class WaveRenderService {
         this.particles = new WaveParticleEmitter();
         this.waterFlow = new WaterFlowFactory();
         this.biomeFetch = new BiomeFetchSampler(configSupplier);
+        this.surfaceScanner = new ChunkSurfaceScanner(biomeFetch);
     }
 
     public void tickPlayer(final Player player, final long simulationTick) {
@@ -138,7 +138,7 @@ public final class WaveRenderService {
     }
 
     public void markDirtyNearChunk(final World world, final int chunkX, final int chunkZ) {
-        invalidateChunkCache(world, chunkX, chunkZ);
+        surfaceScanner.invalidateNear(world, chunkX, chunkZ);
         final PluginConfig config = configSupplier.get();
         for (final Player player : Bukkit.getOnlinePlayers()) {
             if (!player.getWorld().equals(world)) {
@@ -157,7 +157,7 @@ public final class WaveRenderService {
         for (final PlayerWaveState state : playerStates.values()) {
             state.markDirty();
         }
-        chunkSurfaceCache.clear();
+        surfaceScanner.clear();
         shoreDirectionCache.clear();
         restoreAllPhysicalShoreCells();
         physicalCellRefractoryUntil.clear();
@@ -186,7 +186,7 @@ public final class WaveRenderService {
         }
         playerStates.clear();
         playerRunups.clear();
-        chunkSurfaceCache.clear();
+        surfaceScanner.clear();
         shoreDirectionCache.clear();
         restoreAllPhysicalShoreCells();
         physicalCellRefractoryUntil.clear();
@@ -198,7 +198,7 @@ public final class WaveRenderService {
         }
         playerStates.clear();
         playerRunups.clear();
-        chunkSurfaceCache.clear();
+        surfaceScanner.clear();
         shoreDirectionCache.clear();
         restoreAllPhysicalShoreCellsImmediate();
         physicalCellRefractoryUntil.clear();
@@ -220,12 +220,12 @@ public final class WaveRenderService {
         final int centerZ = chunkAnchor(player.getLocation().getBlockZ());
 
         if (!scheduler.isFolia()) {
-            final List<SurfaceColumn> columns = scanArea(world, centerX, centerZ, scanRadius, simulationTick);
+            final List<SurfaceColumn> columns = surfaceScanner.scanArea(world, centerX, centerZ, scanRadius, simulationTick);
             state.completeScan(centerX, centerZ, simulationTick, columns);
             return;
         }
 
-        final List<int[]> chunks = collectChunks(centerX, centerZ, scanRadius);
+        final List<int[]> chunks = surfaceScanner.collectChunks(centerX, centerZ, scanRadius);
         if (chunks.isEmpty()) {
             state.completeScan(centerX, centerZ, simulationTick, List.of());
             return;
@@ -238,7 +238,7 @@ public final class WaveRenderService {
             final int chunkX = chunk[0];
             final int chunkZ = chunk[1];
             scheduler.runRegion(world, chunkX, chunkZ, () -> {
-                collected.addAll(scanChunk(world, chunkX, chunkZ, centerX, centerZ, scanRadius, simulationTick));
+                collected.addAll(surfaceScanner.scanChunk(world, chunkX, chunkZ, centerX, centerZ, scanRadius, simulationTick));
                 if (remaining.decrementAndGet() == 0) {
                     scheduler.runPlayer(player, () -> {
                         if (!player.isOnline() || !player.getWorld().equals(world)) {
@@ -250,108 +250,6 @@ public final class WaveRenderService {
                 }
             });
         }
-    }
-
-    private List<SurfaceColumn> scanArea(
-            final World world,
-            final int centerX,
-            final int centerZ,
-            final int scanRadius,
-            final long simulationTick
-    ) {
-        final List<SurfaceColumn> columns = new ArrayList<>();
-        final List<int[]> chunks = collectChunks(centerX, centerZ, scanRadius);
-        for (final int[] chunk : chunks) {
-            columns.addAll(scanChunk(world, chunk[0], chunk[1], centerX, centerZ, scanRadius, simulationTick));
-        }
-        return columns;
-    }
-
-    private List<SurfaceColumn> scanChunk(
-            final World world,
-            final int chunkX,
-            final int chunkZ,
-            final int centerX,
-            final int centerZ,
-            final int radius,
-            final long simulationTick
-    ) {
-        if (!world.isChunkLoaded(chunkX, chunkZ)) {
-            return List.of();
-        }
-        final List<SurfaceColumn> baseColumns = getOrCreateChunkColumns(world, chunkX, chunkZ, simulationTick);
-        if (baseColumns.isEmpty()) {
-            return List.of();
-        }
-        final int radiusSquared = radius * radius;
-        final List<SurfaceColumn> filtered = new ArrayList<>(baseColumns.size());
-        for (final SurfaceColumn column : baseColumns) {
-            final int dx = column.x() - centerX;
-            final int dz = column.z() - centerZ;
-            if ((dx * dx) + (dz * dz) > radiusSquared) {
-                continue;
-            }
-            filtered.add(column);
-        }
-        return filtered;
-    }
-
-    private List<SurfaceColumn> getOrCreateChunkColumns(
-            final World world,
-            final int chunkX,
-            final int chunkZ,
-            final long simulationTick
-    ) {
-        final ChunkCacheKey key = new ChunkCacheKey(world.getUID(), chunkX, chunkZ);
-        final ChunkSurfaceCache existing = chunkSurfaceCache.get(key);
-        if (existing != null && (simulationTick - existing.tick()) <= CHUNK_CACHE_TTL_TICKS) {
-            return existing.columns();
-        }
-
-        final int minX = chunkX << 4;
-        final int minZ = chunkZ << 4;
-        final List<SurfaceColumn> columns = new ArrayList<>(256);
-        for (int x = minX; x < minX + 16; x++) {
-            for (int z = minZ; z < minZ + 16; z++) {
-                final SurfaceColumn column = findSurfaceColumn(world, x, z);
-                if (column != null) {
-                    columns.add(column);
-                }
-            }
-        }
-        final List<SurfaceColumn> immutable = List.copyOf(columns);
-        chunkSurfaceCache.put(key, new ChunkSurfaceCache(simulationTick, immutable));
-        return immutable;
-    }
-
-    private SurfaceColumn findSurfaceColumn(final World world, final int x, final int z) {
-        if (!isChunkLoaded(world, x, z)) {
-            return null;
-        }
-        final int worldMin = world.getMinHeight();
-        final int worldMax = world.getMaxHeight() - 2;
-        int top = world.getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE);
-        top = Math.max(worldMin + 1, Math.min(worldMax, top));
-        final int floor = Math.max(worldMin + 1, top - 8);
-
-        for (int y = top; y >= floor; y--) {
-            final Material current = world.getBlockAt(x, y, z).getType();
-            if (!isWaterBodyMaterial(current) && !isWaterVegetation(current)) {
-                continue;
-            }
-            if (!isSurfaceOpenAbove(world, x, y, z)) {
-                continue;
-            }
-            final int surfaceWaterY = resolveSurfaceWaterY(world, x, y, z, floor);
-            if (surfaceWaterY != Integer.MIN_VALUE) {
-                final int depth = waterDepthAt(world, x, surfaceWaterY, z);
-                if (!biomeFetch.isOceanWaveArea(world, x, surfaceWaterY, z, depth)) {
-                    continue;
-                }
-                return new SurfaceColumn(x, surfaceWaterY, z, depth);
-            }
-        }
-        return null;
     }
 
     private void applyVisuals(
@@ -668,20 +566,6 @@ public final class WaveRenderService {
             final long pruneBefore = simulationTick - (VISUAL_STICKY_TICKS * 3L);
             sticky.entrySet().removeIf(entry -> entry.getValue() < pruneBefore && !active.containsKey(entry.getKey()));
         }
-    }
-
-    private List<int[]> collectChunks(final int centerX, final int centerZ, final int radius) {
-        final int minChunkX = (centerX - radius) >> 4;
-        final int maxChunkX = (centerX + radius) >> 4;
-        final int minChunkZ = (centerZ - radius) >> 4;
-        final int maxChunkZ = (centerZ + radius) >> 4;
-        final List<int[]> chunks = new ArrayList<>();
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
-            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
-                chunks.add(new int[] {chunkX, chunkZ});
-            }
-        }
-        return chunks;
     }
 
     private void sendPacked(final Player player, final long packed, final Material material) {
@@ -1773,22 +1657,10 @@ public final class WaveRenderService {
             return;
         }
         lastChunkCacheCleanupTick = simulationTick;
-        if (!chunkSurfaceCache.isEmpty()) {
-            final long maxAge = CHUNK_CACHE_TTL_TICKS * 2L;
-            chunkSurfaceCache.entrySet().removeIf(entry -> (simulationTick - entry.getValue().tick()) > maxAge);
-        }
+        surfaceScanner.cleanupStale(simulationTick);
         if (!shoreDirectionCache.isEmpty()) {
             final long maxAge = SHORE_DIRECTION_CACHE_TTL_TICKS + 400L;
             shoreDirectionCache.entrySet().removeIf(entry -> (simulationTick - entry.getValue().cachedTick()) > maxAge);
-        }
-    }
-
-    private void invalidateChunkCache(final World world, final int chunkX, final int chunkZ) {
-        final UUID worldId = world.getUID();
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                chunkSurfaceCache.remove(new ChunkCacheKey(worldId, chunkX + dx, chunkZ + dz));
-            }
         }
     }
 
@@ -1847,12 +1719,6 @@ public final class WaveRenderService {
 
     private record ShoreDirectionBias(double x, double z, double bias, int shorelineDistance) {
         private static final ShoreDirectionBias NONE = new ShoreDirectionBias(0.0D, 0.0D, 0.0D, Integer.MAX_VALUE);
-    }
-
-    private record ChunkCacheKey(UUID worldId, int chunkX, int chunkZ) {
-    }
-
-    private record ChunkSurfaceCache(long tick, List<SurfaceColumn> columns) {
     }
 
     private record ShoreColumnKey(UUID worldId, int x, int z) {
