@@ -21,7 +21,6 @@ import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
-import org.bukkit.block.data.Levelled;
 import org.bukkit.entity.Boat;
 import org.bukkit.entity.Player;
 
@@ -51,7 +50,6 @@ public final class WaveRenderService {
     private static final long RUNUP_TRIGGER_COOLDOWN_TICKS = 18L;
     private static final double RUNUP_ADVANCE_TICKS_PER_BLOCK = 4.0D;
     private static final double RUNUP_RETREAT_TICKS_PER_BLOCK = 5.0D;
-    private static final int[] CREST_FLOW_LEVELS = {7, 6, 5, 4, 3, 2, 1};
     private static final int[][] RUNUP_DIRECTIONS = {
             {1, 0}, {-1, 0}, {0, 1}, {0, -1},
             {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
@@ -64,13 +62,12 @@ public final class WaveRenderService {
     private final PlayerToggleService toggleService;
     private final BoatLifter boatLifter;
     private final WaveParticleEmitter particles;
+    private final WaterFlowFactory waterFlow;
     private final Map<UUID, PlayerWaveState> playerStates = new ConcurrentHashMap<>();
     private final Map<UUID, Map<Long, ShoreRunupState>> playerRunups = new ConcurrentHashMap<>();
     private final Map<ChunkCacheKey, ChunkSurfaceCache> chunkSurfaceCache = new ConcurrentHashMap<>();
     private final Map<PhysicalCellKey, PhysicalShoreCell> physicalShoreCells = new ConcurrentHashMap<>();
     private final Map<PhysicalCellKey, Long> physicalCellRefractoryUntil = new ConcurrentHashMap<>();
-    private final Map<Integer, BlockData> flowingWaterDataCache = new ConcurrentHashMap<>();
-    private final Map<Integer, String> flowingWaterVisualDataStringCache = new ConcurrentHashMap<>();
     private final Map<ShoreColumnKey, CachedShoreDirection> shoreDirectionCache = new ConcurrentHashMap<>();
     private volatile long lastChunkCacheCleanupTick = Long.MIN_VALUE;
     private volatile long lastPhysicalCleanupTick = Long.MIN_VALUE;
@@ -89,6 +86,7 @@ public final class WaveRenderService {
         this.toggleService = toggleService;
         this.boatLifter = new BoatLifter(scheduler);
         this.particles = new WaveParticleEmitter();
+        this.waterFlow = new WaterFlowFactory();
     }
 
     public void tickPlayer(final Player player, final long simulationTick) {
@@ -493,9 +491,9 @@ public final class WaveRenderService {
                             // Near shore: use a shallow Levelled water level so the wave
                             // tapers to a thin wash rather than a full-height block.
                             final int shoreLevel = shorelineDistance == 2 ? 7 : 5;
-                            fakeData = flowingWaterVisualData(shoreLevel);
+                            fakeData = waterFlow.flowingWaterVisualData(shoreLevel);
                         } else {
-                            fakeData = crestTopVisualWaterData(smoothedHeight, steps, visualCap);
+                            fakeData = waterFlow.crestTopVisualWaterData(smoothedHeight, steps, visualCap);
                         }
                     } else {
                         fakeData = null;
@@ -1204,7 +1202,7 @@ public final class WaveRenderService {
                     );
 
                     final int level = clamp(placement.level(), 1, 7);
-                    final BlockData targetData = flowingWaterData(level).clone();
+                    final BlockData targetData = waterFlow.flowingWaterData(level).clone();
                     if (!block.getBlockData().matches(targetData)) {
                         block.setBlockData(targetData, false);
                     }
@@ -1775,48 +1773,6 @@ public final class WaveRenderService {
         }
         final double t = clamp((value - edge0) / (edge1 - edge0), 0.0D, 1.0D);
         return t * t * (3.0D - (2.0D * t));
-    }
-
-    private BlockData flowingWaterData(final int level) {
-        final int waterLevel = clamp(level, 1, 7);
-        return flowingWaterDataCache.computeIfAbsent(waterLevel, ignored -> {
-            final Levelled data = (Levelled) Bukkit.createBlockData(Material.WATER);
-            data.setLevel(waterLevel);
-            return data;
-        });
-    }
-
-    private String flowingWaterVisualData(final int level) {
-        final int waterLevel = clamp(level, 1, 7);
-        return flowingWaterVisualDataStringCache.computeIfAbsent(
-                waterLevel,
-                ignored -> flowingWaterData(waterLevel).getAsString()
-        );
-    }
-
-    private String crestTopVisualWaterData(
-            final double smoothedHeight,
-            final int steps,
-            final double visualCap
-    ) {
-        if (steps <= 1) {
-            final double oneStepFill = clamp(smoothedHeight / Math.max(0.35D, visualCap * 0.92D), 0.0D, 1.0D);
-            if (oneStepFill >= 0.985D) {
-                return null;
-            }
-            final double curved = Math.pow(oneStepFill, 0.72D);
-            final int idx = clamp((int) Math.round(curved * (CREST_FLOW_LEVELS.length - 1)), 0, CREST_FLOW_LEVELS.length - 1);
-            final int oneStepLevel = CREST_FLOW_LEVELS[idx];
-            return flowingWaterVisualData(oneStepLevel);
-        }
-        final double topFill = clamp(smoothedHeight - (steps - 1), 0.0D, 1.0D);
-        final double globalFill = clamp(smoothedHeight / Math.max(0.01D, visualCap), 0.0D, 1.0D);
-        final double combinedFill = (topFill * 0.72D) + (globalFill * 0.28D);
-        if (combinedFill >= 0.94D) {
-            return null;
-        }
-        final int flowingLevel = clamp(7 - (int) Math.round(combinedFill * 6.0D), 1, 7);
-        return flowingWaterVisualData(flowingLevel);
     }
 
     private boolean isVisualReplaceable(final Material material) {
