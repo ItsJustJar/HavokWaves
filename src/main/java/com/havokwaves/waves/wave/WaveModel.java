@@ -54,12 +54,13 @@ public final class WaveModel {
         final double travelSpeed = profile.speed() * (0.42D + (freq * 0.62D));
         final double effectiveTravelSpeed = travelSpeed * (1.0D - (shallow * 0.22D));
 
-        // Storm mode: wind direction shifts more rapidly and with wider sweep, creating
-        // coherent directional swell rather than omnidirectional chop.
+        // Storm mode: wind direction shifts rapidly but with a tighter sweep so the
+        // primary heading stays coherent. Wide sweep made storm waves feel directionless
+        // because the heading wandered too far between samples.
         // baseAngle is the world-seeded drift direction from the render service so model
         // and visual directions stay in sync.
         final double windDriftRate = storming ? 0.018D : 0.006D;
-        final double windDriftAmp  = storming ? 0.45D  : 0.20D;
+        final double windDriftAmp  = storming ? 0.30D  : 0.20D;
         final double windAngle = baseAngle + (Math.sin(t * windDriftRate) * windDriftAmp);
         final double windX = Math.cos(windAngle);
         final double windZ = Math.sin(windAngle);
@@ -99,8 +100,10 @@ public final class WaveModel {
         final double d2 = directionalComponent(warpedX, warpedZ, t, effectiveSpatialK, effectiveTravelSpeed, a2, 0.92D, 0.93D, 2.1D);
         final double d3 = directionalComponent(warpedX, warpedZ, t, effectiveSpatialK, effectiveTravelSpeed, a3, 0.80D, 0.82D, 4.0D);
         // Primary swell dominates heavily — d1 carries most of the wave energy.
-        final double d1w = storming ? 0.65D : 0.68D;
-        final double d2w = storming ? 0.22D : 0.20D;
+        // Storm dials d1 up so the rolling direction stays unmistakable even when the
+        // chop layer is active.
+        final double d1w = storming ? 0.78D : 0.68D;
+        final double d2w = storming ? 0.15D : 0.20D;
         final double d3w = 1.0D - d1w - d2w;
         final double directionalField = (d1 * d1w) + (d2 * d2w) + (d3 * d3w);
 
@@ -128,9 +131,9 @@ public final class WaveModel {
         );
         final double collisionField = ((counterA * d2) + (counterB * d1)) * (0.08D + (stormEnergy * 0.28D));
 
-        // Storm: cap omnidirectional cross-chop — real storms produce big directed swells,
-        // not noise in every direction equally.
-        final double crossChopStormScale = storming ? stormEnergy * 0.09D : stormEnergy * 0.16D;
+        // Storm: keep a meaningful chop layer for that "hectic" texture, but capped so
+        // it doesn't drown out the dominant swell direction.
+        final double crossChopStormScale = storming ? stormEnergy * 0.13D : stormEnergy * 0.16D;
         final double crossChop = Math.sin(
             ((warpedX * 0.061D) - (warpedZ * 0.054D)) * (effectiveSpatialK * 0.63D)
                 - (t * effectiveTravelSpeed * 0.42D)
