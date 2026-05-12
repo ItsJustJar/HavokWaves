@@ -47,7 +47,7 @@ import static com.havokwaves.waves.service.WorldProbes.resolveSurfaceWaterY;
 import static com.havokwaves.waves.service.WorldProbes.waterDepthAt;
 
 public final class WaveRenderService {
-    private static final long VISUAL_STICKY_TICKS = 12L;
+    private static final long VISUAL_STICKY_TICKS = 6L;
     private static final long SHORE_DIRECTION_CACHE_TTL_TICKS = 600L;
     private static final long COLUMN_VISUAL_MEMORY_TICKS = 220L;
     private static final int RENDER_EDGE_BLEND_BLOCKS = 20;
@@ -839,7 +839,7 @@ public final class WaveRenderService {
         if (sample.visualBand() <= 0) {
             return 0;
         }
-        final int stepBoost = crestSteps >= 3 ? 2 : (crestSteps >= 2 ? 1 : 0);
+        final int stepBoost = crestSteps >= 2 ? 1 : 0;
         final int intensityBoost = (int) Math.floor(sample.intensity() * 0.6D);
         return clamp(2 + stepBoost + intensityBoost, 2, 6);
     }
@@ -1275,38 +1275,18 @@ public final class WaveRenderService {
         final double step1Exit = 0.04D;
         final double step2Enter = 0.38D + (stormScale * 0.04D) + (chopScale * 0.02D);
         final double step2Exit = 0.18D + (stormScale * 0.03D) + (chopScale * 0.01D);
-        final double step3Enter = 0.66D + (stormScale * 0.08D) + (chopScale * 0.03D);
-        final double step3Exit = 0.42D + (stormScale * 0.06D) + (chopScale * 0.02D);
 
-        if (previousStep >= 3) {
-            if (visualHeight >= step3Exit) {
-                return 3;
-            }
-            if (visualHeight >= step2Exit) {
-                return 2;
-            }
-            return visualHeight >= step1Exit ? 1 : 0;
-        }
-        if (previousStep == 2) {
-            if (visualHeight >= step3Enter) {
-                return 3;
-            }
+        if (previousStep >= 2) {
             if (visualHeight >= step2Exit) {
                 return 2;
             }
             return visualHeight >= step1Exit ? 1 : 0;
         }
         if (previousStep == 1) {
-            if (visualHeight >= step3Enter) {
-                return 3;
-            }
             if (visualHeight >= step2Enter) {
                 return 2;
             }
             return visualHeight >= step1Exit ? 1 : 0;
-        }
-        if (visualHeight >= step3Enter) {
-            return 3;
         }
         if (visualHeight >= step2Enter) {
             return 2;
